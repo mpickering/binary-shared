@@ -12,6 +12,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE StandaloneDeriving #-}
 module MyLib where
 
 import Data.Word
@@ -38,6 +39,9 @@ import Data.Array
 import qualified Data.Dependent.Sum as DMap
 import Data.List
 import Data.Ord
+import Data.Some
+import Data.Functor.Product
+import Data.GADT.Show
 
 data TAG a where
   FS :: FastString -> TAG FastString
@@ -49,9 +53,18 @@ data SingTag a where
   FS_NAME :: SingTag Name
   FS_IFR  :: SingTag IfTyConInfo
 
+deriving instance Show (SingTag a)
+
 type family Sing f where
   Sing TAG = SingTag
 
+class HasSing f where
+  witness :: f a -> Sing f a
+
+instance HasSing TAG where
+  witness (FS{}) = FS_SING
+  witness (N{})  = FS_NAME
+  witness (IFR{}) = FS_IFR
 
 untag :: TAG a -> a
 untag (FS f) = f
@@ -64,15 +77,15 @@ data Name = Name FastString Int deriving (Eq, Ord, Show)
 data IfTyConInfo = IfTyConInfo Int Int deriving (Eq, Ord, Show)
 
 data GetKey (f :: * -> *) (a :: *) where
-  GetKey :: Sing f a -> Int -> GetKey f a
+  GetKey :: RTTI f a -> Int -> GetKey f a
 
-instance GEq (Sing f) => GEq (GetKey f) where
+instance GEq (RTTI f) => GEq (GetKey f) where
   geq (GetKey s1 i) (GetKey s2 i2) =
     case geq s1 s2 of
       Just Refl -> if i == i2 then Just Refl else Nothing
       Nothing -> Nothing
 
-instance GCompare (Sing f) => GCompare (GetKey f) where
+instance GCompare (RTTI f) => GCompare (GetKey f) where
   gcompare g1@(GetKey s1 i) g2@(GetKey s2 i2) =
     case geq g1 g2 of
       Just Refl -> GEQ
@@ -80,7 +93,49 @@ instance GCompare (Sing f) => GCompare (GetKey f) where
         if i < i2 then GLT
                   else GGT
 
+data family RTTI (f :: k -> *) :: (k -> *)
 
+deriving instance Show (RTTI TAG a)
+deriving instance Show (TAG a)
+
+instance GShow (RTTI TAG) where
+  gshowsPrec = defaultGshowsPrec
+
+instance GShow (TAG) where
+  gshowsPrec = defaultGshowsPrec
+
+data instance RTTI TAG a where
+  RttiValFastString :: RTTI TAG FastString
+  RttiValName :: RTTI TAG Name
+  RttiValIfTyConInfo :: RTTI TAG IfTyConInfo
+
+instance GEq (RTTI TAG) where
+  geq RttiValFastString RttiValFastString = Just Refl
+  geq RttiValName RttiValName = Just Refl
+  geq RttiValIfTyConInfo RttiValIfTyConInfo = Just Refl
+  geq _ _ = Nothing
+
+instance GCompare (RTTI TAG) where
+  gcompare x1 x2 =
+    case geq x1 x2 of
+      Just Refl -> GEQ
+      Nothing -> case x1 of
+                    RttiValFastString -> GLT
+                    RttiValName -> case x2 of
+                                      RttiValFastString -> GGT
+                                      _ -> GLT
+                    _ -> GGT
+
+
+
+
+
+class HasRTTI f a where
+  rtti :: RTTI f a
+
+instance HasRTTI TAG FastString where rtti = RttiValFastString
+instance HasRTTI TAG Name where rtti = RttiValName
+instance HasRTTI TAG IfTyConInfo where rtti = RttiValIfTyConInfo
 
 deriveGEq ''TAG
 deriveGCompare ''TAG
@@ -88,48 +143,85 @@ deriveGCompare ''TAG
 deriveGEq ''SingTag
 deriveGCompare ''SingTag
 
+
+
 instance Binary TAG FastString where
-  get h = untag <$> getShared h FS_SING
+  get h = untag <$> getShared h rtti
   put h fs = putShared h (FS fs)
 
 instance Binary TAG Name where
-  get h = untag <$> getShared h FS_NAME
+  get h = untag <$> getShared h rtti
   put h n = putShared h (N n)
 
 instance Binary TAG IfTyConInfo where
-  get h = untag <$> getShared h FS_IFR
+  get h = untag <$> getShared h rtti
   put h n = putShared h (IFR n)
 
-instance Binary TAG (TAG Name) where
+instance (Binary f FastString, HasRTTI TAG a) => Binary f (TAG a) where
+  get h = do
+    case rtti @TAG @a of
+              RttiValFastString -> FS . FastString <$> get h
+              RttiValName -> (\x y -> N (Name x y)) <$> get h <*> get h
+              RttiValIfTyConInfo -> (\x y -> IFR (IfTyConInfo x y)) <$> get h <*> get h
+
+
+  put h v =
+    case v of
+      FS (FastString f) -> put h f
+      IFR (IfTyConInfo x1 x2) -> put h x1 >> put h x2
+      N (Name f n) -> put h f >> put h n
+
+{-
+instance Binary f FastString => Binary f (TAG Name) where
   get h = (\x y -> N (Name x y)) <$> get h <*> get h
   put h (N (Name f n)) = do
     put h f
     put h n
 
-instance Binary TAG (TAG FastString) where
+instance Binary f (TAG FastString) where
   get h = FS . FastString <$> get h
   put h (FS (FastString f)) = put h f
 
-instance Binary TAG (TAG IfTyConInfo) where
+instance Binary f (TAG IfTyConInfo) where
   get h = (\x y -> IFR (IfTyConInfo x y)) <$> get h <*> get h
   put h (IFR (IfTyConInfo x1 x2)) = put h x1 >> put h x2
+  -}
+
+instance Binary TAG (Some (Product (RTTI TAG) TAG)) where
+  -- lazyPut/lazyGet here is critical because we need to know enough about each item
+  -- to place it into the lookup map (so the offset and it's type) but not enough to
+  -- force the decoding as earlier things may well refer to later things.
+  get h = do
+    b <- getByte h
+    case b of
+      0 -> Some <$> (Pair <$> pure rtti <*> lazyGet @TAG @(TAG FastString) h)
+      1 -> Some <$> (Pair <$> pure rtti <*> lazyGet @TAG @(TAG Name) h)
+      2 -> Some <$> (Pair <$> pure rtti <*> lazyGet @TAG @(TAG IfTyConInfo) h)
+
+  put h (Some (Pair _ v)) = do
+    case v of
+      FS{} -> putByte h 0 >> lazyPut h v
+      N{}  -> putByte h 1 >> lazyPut h v
+      IFR{} -> putByte h 2 >> lazyPut h v
+
+
+
 
 encode_bs :: Binary TAG a => a -> B.ByteString
 encode_bs a = unsafePerformIO $ do
   rh <- openBinMem (1024*1024)
   h <- initShared @TAG rh
-  forwardPut rh (const (put_dictionary h)) $ do
+  forwardPut rh (const (putDictionary h)) $ do
     put h a
   toByteString rh
 
 decode_bs :: Binary TAG a => B.ByteString -> a
 decode_bs b = unsafePerformIO $ do
   h <- fromByteString b
-  dict <- forwardGet h (getDictionary h)
-  l <- newFastMutInt 0
   get_map <- newIORef DMap.empty
-  let hf = H_READ @TAG h dict get_map
-  get hf
+  let h_read = H_READ @TAG h get_map
+  dict <- forwardGet h (getDictionary h_read)
+  get h_read
 
 share :: Binary TAG a => a -> a
 share = decode_bs . encode_bs
@@ -139,22 +231,29 @@ encode :: Binary TAG a => FilePath -> a -> IO ()
 encode fp a = do
   rh <- openBinMem (1024*1024)
   h <- initShared @TAG rh
-  forwardPut rh (const (put_dictionary h)) $ do
+  forwardPut rh (const (putDictionary h)) $ do
     put h a
   writeBinMem rh fp
 
-put_dictionary :: H_WRITE f -> IO ()
-put_dictionary h = do
-  n <- readFastMutInt (shared_count h)
-  buff <- readIORef (shared h)
-  putDictionary (raw_write h) n buff
+putDictionary :: H_WRITE TAG -> IO ()
+putDictionary rh = do
+  -- As the dictionary is written, we might encounter new things we need to share,
+  -- so keep looping until we don't add any new things.
+  let
+    loop bound = do
+      d <- readIORef (shared rh)
+      n <- readFastMutInt (shared_count rh)
+      let vs = sortBy (comparing fst) [ (n, Some (Pair rtti b)) | _ DMap.:=> (Payload n rtti b)  <- DMap.assocs d, n >= fromIntegral bound ]
+      case vs of
+        [] -> return ()
+        todo ->  do
+          print (map snd todo)
+          mapM_ (put rh . snd) todo
+          loop n
 
-putDictionary :: RH -> Int -> DMap.DMap f (Payload f) -> IO ()
-putDictionary rh n shared_rh = do
-  putWord32 rh (fromIntegral n)
-  -- The map will contain all keys from 0..n
-  let vs = sortBy (comparing fst) [ (n, b) | _ DMap.:=> (Payload n _ b)  <- DMap.assocs shared_rh ]
-  mapM_ (putBS rh . snd) vs
+  forwardPut (raw_write rh) (const $ readFastMutInt (shared_count rh) >>= put rh) $
+    loop 0
+  return ()
 
 putBS :: RH -> B.ByteString -> IO ()
 putBS bh bs =
@@ -168,22 +267,51 @@ getBS bh = do
   BI.create (fromIntegral l) $ \dest -> do
     getPrim bh (fromIntegral l) (\src -> copyBytes dest src (fromIntegral l))
 
+lazyPut :: Binary f a => H_WRITE f -> a -> IO ()
+lazyPut bh a = do
+    -- output the obj with a ptr to skip over it:
+    pre_a <- tellBin (raw_write bh)
+    putBin (raw_write bh) pre_a       -- save a slot for the ptr
+    put bh a           -- dump the object
+    q <- tellBin (raw_write bh)    -- q = ptr to after object
+    putAt (raw_write bh) pre_a putBin q    -- fill in slot before a with ptr to q
+    seekBin (raw_write bh) q        -- finally carry on writing at q
 
-getDictionary :: RH -> IO (Array Int B.ByteString)
+lazyGet :: Binary f a => H_READ f -> IO a
+lazyGet bh = do
+    p <- getBin (raw_read bh) -- a BinPtr
+    p_a <- tellBin (raw_read bh)
+    a <- unsafeInterleaveIO $ do
+        -- NB: Use a fresh off_r variable in the child thread, for thread
+        -- safety.
+        off_r <- newFastMutInt 0
+        getAt bh { raw_read = (raw_read bh) { _off_r =  off_r } } p_a
+    seekBin (raw_read bh) p -- skip over the object for now
+    return a
+
+getAt bh p = seekBin (raw_read bh) p >> get bh
+
+
+getDictionary :: forall f . H_READ TAG -> IO ()
 getDictionary rh = do
-  n <- getWord32 rh
-  bs <- replicateM (fromIntegral n) (getBS rh)
-  return $ listArray (0, fromIntegral n) bs
+  n <- forwardGet (raw_read rh) (get @TAG @Int rh)
+  let get_one k = do
+        v <- get @TAG @(Some (Product (RTTI TAG) TAG)) rh
+        case v of
+          Some (Pair rtti (v :: TAG a)) -> do
+           modifyIORef' (shared_get rh) (DMap.insert (GetKey @TAG @a rtti (fromIntegral k)) v)
+
+  mapM_ get_one [0..n-1]
 
 
 
 decode :: Binary TAG a => FilePath -> IO a
 decode fp = do
   h <- readBinMem fp
-  dict <- forwardGet h (getDictionary h)
-  l <- newFastMutInt 0
   get_map <- newIORef DMap.empty
-  let hf = H_READ @TAG h dict get_map
+  let hf = H_READ @TAG h get_map
+  dict <- forwardGet h (getDictionary hf)
+  l <- newFastMutInt 0
   get hf
 
 readBinMem_ :: Int -> Handle -> IO RH
@@ -303,12 +431,13 @@ seekBinNoExpand (RH ix_r sz_r _) (BinPtr !p) = do
 
 
 data Payload f a = Payload Word32 -- n
-                           (Proxy a) -- The type
-                           B.ByteString -- The serialised key
+                           (RTTI f a) -- The type
+                           (f a) -- The serialised key
 
 
-instance Functor f => Functor (Payload f) where
-  fmap f (Payload n a b) = Payload n (f <$> a) b
+--instance (Functor (RTTI f), Functor f) => Functor (Payload f) where
+--  fmap f (Payload n a b) = Payload n (f <$> a) (f <$> b)
+
 
 
 data RH
@@ -323,7 +452,6 @@ getCurrentOffset (RH off _ _) = readFastMutInt off
 
 data H_READ f = H_READ {
          raw_read :: RH,
-         shared_buffer :: (Array Int B.ByteString), -- A list of keys, only used for deserialising
          shared_get :: (IORef (DMap.DMap (GetKey f) f)) -- A map from offsets to decoded keys
        }
 
@@ -345,11 +473,13 @@ fromByteString (BI.BS p l) = do
   return (RH off len cont)
 
 
-
-
 class Binary f a where
   put :: H_WRITE f -> a -> IO ()
   get :: H_READ f -> IO a
+
+class GBinary f where
+  gput :: H_WRITE f -> f a -> IO ()
+  gget :: H_READ f  -> IO (f a)
 
 instance Binary f () where
   put _ () = return ()
@@ -360,8 +490,8 @@ instance Binary f Word8 where
   get h = getWord8 (raw_read h)
 
 instance Binary f Char where
-     put  bh c = putWord32 (raw_write bh) (fromIntegral (ord c) :: Word32)
-     get  bh   = do x <- getWord32 (raw_read bh); return $! (chr (fromIntegral (x :: Word32)))
+     put  bh c = put bh (fromIntegral (ord c) :: Word32)
+     get  bh   = do x <- get bh; return $! (chr (fromIntegral (x :: Word32)))
 
 instance Binary f a => Binary f [a] where
     put bh l = do
@@ -377,6 +507,10 @@ instance Binary f a => Binary f [a] where
         loop len
 
 instance Binary f Int where
+  get h = getSLEB128 (raw_read h)
+  put h = putSLEB128 (raw_write h)
+
+instance Binary f Word32 where
   get h = getSLEB128 (raw_read h)
   put h = putSLEB128 (raw_write h)
 
@@ -447,41 +581,35 @@ getByte h = getWord8 (raw_read h)
 
 
 
-putShared :: (GCompare f, Binary f (f a)) => H_WRITE f -> f a -> IO ()
+putShared :: (HasRTTI f a, GCompare f, Binary f (f a)) => H_WRITE f -> f a -> IO ()
 putShared h key = do
   shared_cache <- readIORef (shared h)
   case DMap.lookup key shared_cache of
     (Just (Payload n _ _)) -> putSLEB128 (raw_write h) n
     Nothing -> do
+
+--      rh' <- openBinMem 10
+--      let h' = h { raw_write = rh' }
+--      put h' (Some key)
+--      key_payload <- toByteString rh'
+
       n <- readFastMutInt (shared_count h)
       writeFastMutInt (shared_count h) (n + 1)
 
-      rh' <- openBinMem 10
-      let h' = h { raw_write = rh' }
-      put h' key
-      key_payload <- toByteString rh'
-
-      let payload = Payload (fromIntegral n) Proxy key_payload
+      let payload = Payload (fromIntegral n) rtti key
       modifyIORef (shared h) (DMap.insert key payload)
       putSLEB128 (raw_write h) n
 
 
-getShared :: forall f a . (Binary f (f a), GCompare (GetKey f)) => H_READ f -> Sing f a -> IO (f a)
+getShared :: forall f a . (Binary f (f a), GCompare (GetKey f)) => H_READ f -> RTTI f a -> IO (f a)
 getShared h key = do
   -- 1. Get the offset into shared buffer
   n <- getSLEB128 @Word32 (raw_read h)
-  -- 2. Lookup to see if we already decode that offset (to avoid reallocating)
+  -- 2. Lookup in the shared, buffer, the value is here unforced currently
   shared_cache <- readIORef (shared_get h)
   case DMap.lookup (GetKey @f @a key (fromIntegral n)) shared_cache of
-    -- Not seen before, read from shared buffer.
-    Nothing -> do
-      let bs = (shared_buffer h) ! (fromIntegral n)
-      rh' <- fromByteString bs
-      v <- get @f @(f a) (h { raw_read = rh' })
-      modifyIORef (shared_get h) (DMap.insert (GetKey @f @a key (fromIntegral n)) v)
-      return v
-    Just v -> do
-      return v
+    Nothing -> error (show ("unknown offset", n))
+    Just v -> return v
 
 
 getPrim :: RH -> Int -> (Ptr Word8 -> IO a) -> IO a
